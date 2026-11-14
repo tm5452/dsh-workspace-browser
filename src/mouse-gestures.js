@@ -8,7 +8,6 @@ const feedbackDelay = 450;
 const recognitionDelay = 34;
 const trackingAttribute = 'data-dwb-mouse-gesture-tracking';
 const draggingAttribute = 'data-dwb-mouse-gesture-dragging';
-const labels = { left: '后退', right: '前进', up: '返回上一级', invalid: '无效手势' };
 
 function recordPoint(gesture, { clientX: x, clientY: y, timeStamp }) {
   // Pointer and compatibility mouse events may report the same samples.
@@ -45,7 +44,7 @@ function directionOf(gesture) {
   return y < 0 ? 'up' : 'invalid';
 }
 
-function createFeedback(getBadgeBounds) {
+function createFeedback(getBadgeBounds, actionLabel) {
   const overlay = document.createElement('div');
   overlay.className = 'dwb-mouse-gesture';
   overlay.setAttribute('aria-hidden', 'true');
@@ -107,16 +106,16 @@ function createFeedback(getBadgeBounds) {
     overlay.style.setProperty('--dwb-gesture-badge-y', bounds.top + bounds.height / 2 + 'px');
     overlay.dataset.action = action;
     icon.setAttribute('d', action === 'invalid' ? 'M6 6l12 12M18 6 6 18' : 'M5 12h14m-6-6 6 6-6 6');
-    label.textContent = labels[action];
+    label.textContent = actionLabel(action);
   }
 
   return { draw, render, finish, showAction, hide, overlay };
 }
 
-function installMouseGestures(resolveAction, getBadgeBounds, acceptsTarget) {
+function installMouseGestures(resolveAction, getBadgeBounds, acceptsTarget, actionLabel) {
   const lifetime = new AbortController();
   const options = { capture: true, signal: lifetime.signal };
-  const feedback = createFeedback(getBadgeBounds);
+  const feedback = createFeedback(getBadgeBounds, actionLabel);
   const root = document.documentElement;
   let gesture;
   let suppressMenuUntil = -Infinity;

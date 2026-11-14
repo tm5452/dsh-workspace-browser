@@ -1,6 +1,11 @@
 {
   "name": "dsh-workspace-browser",
-  "version": "0.3.8",
+  "version": "0.4.12",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tm5452/dsh-workspace-browser.git"
+  },
   "description": "Add folder browsing to DeepSeek Harness sidebar view options.",
   "type": "module",
   "main": "./lib/index.js",
@@ -14,11 +19,13 @@
     "client": {
       "platform": "web",
       "inject": [
+        "@deepseek-ai/dsh-api-remotes",
         "@deepseek-ai/dsh-api-workspace-controller",
         "@deepseek-ai/dsh-api-session-controller",
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-context-menu",
         "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-session",
         "@deepseek-ai/dsh-client-ui-sidebar",
         "@deepseek-ai/dsh-client-ui-workspace"
       ]
