@@ -1,0 +1,33 @@
+{
+  "name": "dsh-workspace-browser",
+  "version": "0.3.8",
+  "description": "Add folder browsing to DeepSeek Harness sidebar view options.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-workspace-controller",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-context-menu",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  },
+  "files": ["lib", "src", "scripts", "cordis.patch.yml"],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build"
+  },
+  "keywords": ["dsh-plugin", "deepseek-harness", "workspace", "sessions"]
+}

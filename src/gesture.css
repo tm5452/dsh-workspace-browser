@@ -1,0 +1,30 @@
+[data-dwb-mouse-gesture-tracking] :is(iframe, webview, object, embed) { pointer-events: none !important; }
+[data-dwb-mouse-gesture-dragging] .dwb-mouse-gesture { pointer-events: auto; cursor: default; }
+.dwb-mouse-gesture {
+  position: fixed; inset: 0; z-index: 2147483647;
+  display: grid; place-items: center; pointer-events: none; user-select: none;
+}
+.dwb-mouse-gesture > * { pointer-events: none; }
+.dwb-mouse-gesture-trail {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  fill: none; stroke: #3262E9; stroke-width: 6px; stroke-linecap: round; stroke-linejoin: round;
+}
+.dwb-mouse-gesture[data-stable-click] .dwb-mouse-gesture-trail { visibility: hidden; }
+.dwb-mouse-gesture[data-finished] .dwb-mouse-gesture-trail {
+  animation: dwb-mouse-gesture-trail-fade 220ms ease-out forwards;
+}
+@keyframes dwb-mouse-gesture-trail-fade { to { opacity: 0; } }
+.dwb-mouse-gesture-badge {
+  position: absolute; left: var(--dwb-gesture-badge-x); top: var(--dwb-gesture-badge-y);
+  transform: translate(-50%, -50%);
+  display: none; flex-direction: column; align-items: center; justify-content: center;
+  width: 112px; height: 112px; gap: 8px; border-radius: 20px;
+  background: rgb(0 0 0 / 74%); color: white; font-size: 14px; font-weight: 600; line-height: 1.25;
+}
+.dwb-mouse-gesture[data-action] .dwb-mouse-gesture-badge { display: flex; }
+.dwb-mouse-gesture-badge svg {
+  width: 46px; height: 46px; fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.dwb-mouse-gesture[data-action="left"] .dwb-mouse-gesture-badge svg { transform: rotate(180deg); }
+.dwb-mouse-gesture[data-action="up"] .dwb-mouse-gesture-badge svg { transform: rotate(-90deg); }
