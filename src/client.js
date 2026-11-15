@@ -11,7 +11,7 @@ const defaultOptions = {};
 const emptyView = { getSnapshot: () => defaultOptions, subscribe: () => () => {} };
 const preferenceKey = `${id}.sidebar`;
 const unreadKey = preferenceKey + '.unread';
-const emptyOrder = {};
+const emptyPlacements = {};
 const emptySchedule = { records: [] };
 function scheduleSourceFor(ctx) {
   let snapshot = emptySchedule;
@@ -114,22 +114,25 @@ function workspaceTree(items) {
   return { byId, parents, children };
 }
 
-function manualOrders(workspaces, sessions) {
-  const assigned = new Set(workspaces.items.flatMap(item => item.sessionIds));
-  const byRecency = ids => ids.filter(id => sessions.byId[id]).sort((a, b) =>
-    sessions.byId[b].updatedAt - sessions.byId[a].updatedAt || (a < b ? -1 : 1));
-  const activeBlank = sessions.ids.find(id => sessions.byId[id]?.blank && sessions.byId[id].retainedBy?.mainView > 0);
-  const order = ids => {
-    const sorted = byRecency(ids);
-    return sorted.includes(activeBlank) ? [activeBlank, ...sorted.filter(id => id !== activeBlank)] : sorted;
+/* The order that is on screen right now, per account: the native store freezes exactly this into manual mode. */
+function displayedOrders(workspaceState, sessions, options) {
+  const { byId, ids } = sessions;
+  const archived = new Set(workspaceState.archivedSessionIds);
+  const pinned = new Set(workspaceState.pinnedSessionIds);
+  const assigned = new Set(workspaceState.items.flatMap(workspace => workspace.sessionIds));
+  const rank = session => session.blank ? 0 : pinned.has(session.id) && !archived.has(session.id) ? 1 : 2;
+  const order = (members, account) => {
+    const manual = options.orderBy === 'manual';
+    const stored = new Map((manual ? options.sessionOrderByAccount?.[account] ?? [] : []).map((id, index) => [id, index]));
+    return members.map(id => byId[id]).filter(session => session && session.origin !== 'subagent').sort((a, b) => rank(a) - rank(b)
+      || (stored.get(a.id) ?? Infinity) - (stored.get(b.id) ?? Infinity)
+      || (manual ? Number(archived.has(a.id)) - Number(archived.has(b.id)) : 0)
+      || b.updatedAt - a.updatedAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).map(session => session.id);
   };
   return Object.fromEntries([
-    ...workspaces.items.map(item => [item.workspaceId, order(item.sessionIds)]),
-    [ungrouped, order(sessions.ids.filter(id => !assigned.has(id)))],
-    ['__flat_session_order__', order(sessions.ids.filter(id => {
-      const session = sessions.byId[id];
-      return session && session.origin !== 'subagent' && (!session.blank || id === activeBlank);
-    }))],
+    ...workspaceState.items.map(workspace => [workspace.workspaceId, order(workspace.sessionIds, workspace.workspaceId)]),
+    [ungrouped, order(ids.filter(id => !assigned.has(id)), ungrouped)],
+    ['__flat_session_order__', order(ids, '__flat_session_order__')],
   ]);
 }
 
@@ -155,6 +158,24 @@ function sessionRows(workspaceState, sessions, options) {
   return { byWorkspace, pinned, archived };
 }
 
+/* Mirrors the native tree: one pinned section at a time, and the blank session stays where the sort puts it. */
+function sessionDragOrder(order, rows, drag, over, isPinned) {
+  const source = rows.find(row => row.id === drag.id);
+  const target = rows.find(row => row.id === over.id);
+  if (!source || !target || source.blank) return undefined;
+  if (isPinned(source.id) !== drag.pinned || isPinned(target.id) !== drag.pinned) return undefined;
+  if (source.id === target.id || !order.includes(source.id)) return undefined;
+  const section = rows.filter(row => isPinned(row.id) === drag.pinned);
+  const sourceIndex = section.findIndex(row => row.id === source.id);
+  const targetIndex = section.filter(row => row.id !== source.id).findIndex(row => row.id === target.id);
+  if (targetIndex + (over.side === 'after' ? 1 : 0) === sourceIndex) return undefined;
+  const next = order.filter(id => id !== source.id);
+  const index = next.indexOf(target.id);
+  if (index === -1) return undefined;
+  next.splice(index + (over.side === 'after' ? 1 : 0), 0, source.id);
+  return next;
+}
+
 const statusDetails = {
   approval: { state: 'error', label: 'status.waitingApproval', priority: 3 },
   question: { state: 'warning', label: 'status.waitingAnswer', priority: 2 },
@@ -167,41 +188,130 @@ function completionSource(ctx) {
   const status = ctx.uiSession.sessionStatus;
   const panel = ctx.layout.panelInfo;
   const listeners = new Set();
+  const persistedIds = value => Array.isArray(value) ? value.filter(id => typeof id === 'string') : [];
   let unread = new Set();
+  let awaitingInteraction = new Set();
   try {
     const saved = JSON.parse(localStorage.getItem(unreadKey));
-    if (Array.isArray(saved)) unread = new Set(saved.filter(id => typeof id === 'string'));
+    unread = new Set(persistedIds(Array.isArray(saved) ? saved : saved?.unread));
+    awaitingInteraction = new Set(persistedIds(saved?.awaitingInteraction).filter(id => unread.has(id)));
   } catch { /* Storage may be unavailable. */ }
 
-  let previous = new Set();
+  let previous = new Map();
+  let previousTaskbarStatus = status.getSnapshot();
+  const pendingWhileAway = new Map();
+  const completedWhileAway = new Set();
+  const taskbar = window.dshDesktop?.taskbar;
+  let taskbarColor;
+  const hasAttention = () => document.visibilityState !== 'hidden' && document.hasFocus();
+
+  function save(next, protectedIds = awaitingInteraction) {
+    const changed = next.size !== unread.size || [...next].some(id => !unread.has(id));
+    const protectionChanged = protectedIds.size !== awaitingInteraction.size
+      || [...protectedIds].some(id => !awaitingInteraction.has(id));
+    if (!changed && !protectionChanged) return;
+    if (changed) unread = next;
+    awaitingInteraction = protectedIds;
+    try {
+      localStorage.setItem(unreadKey, JSON.stringify({ unread: [...unread], awaitingInteraction: [...awaitingInteraction] }));
+    } catch { /* Keep the in-memory state. */ }
+    if (changed) for (const listener of listeners) listener();
+  }
+
+  function updateTaskbar(sessions, statuses, focused) {
+    if (!taskbar?.setReminder) return;
+    if (focused) {
+      pendingWhileAway.clear();
+      completedWhileAway.clear();
+    }
+    const archived = new Set(ctx.workspaces.list.getSnapshot().archivedSessionIds);
+    let priority = 0;
+    if (!focused) for (const [id, state] of statuses) {
+      const session = sessions.byId[id];
+      if (!session || session.blank || session.origin === 'subagent' || archived.has(id)) {
+        pendingWhileAway.delete(id);
+        completedWhileAway.delete(id);
+        continue;
+      }
+      const before = previousTaskbarStatus.get(id);
+      const pending = state.pendingInteraction;
+      const previousPending = before?.pendingInteraction;
+      const pendingPriority = statusDetails[pending?.kind]?.priority ?? 0;
+      if (!pendingPriority) pendingWhileAway.delete(id);
+      else if (pending.kind !== previousPending?.kind || pending.key !== previousPending?.key) {
+        pendingWhileAway.set(id, pendingPriority);
+      }
+      if (state.running) completedWhileAway.delete(id);
+      else if (before?.running === true || (state.completionUnread && !before?.completionUnread)) completedWhileAway.add(id);
+      priority = Math.max(priority, pendingWhileAway.get(id) ?? 0, completedWhileAway.has(id) ? 1 : 0);
+    }
+    previousTaskbarStatus = statuses;
+    const color = ['normal', 'green', 'yellow', 'red'][priority];
+    if (color === taskbarColor) return;
+    taskbarColor = color;
+    taskbar.setReminder(color);
+  }
+
   function sync() {
     const sessions = list.getSnapshot();
-    const completed = new Set();
-    const next = new Set(unread);
-    for (const [id, state] of status.getSnapshot()) {
-      if (!state.completionUnread) continue;
-      completed.add(id);
-      if (!previous.has(id)) next.add(id);
-    }
-    previous = completed;
-
+    const statuses = status.getSnapshot();
+    const focused = hasAttention();
     const conversationVisible = panel.getSnapshot().activePanelId === null;
-    for (const id of next) {
+    const next = new Set(unread);
+    const protectedIds = new Set(awaitingInteraction);
+    for (const [id, state] of statuses) {
+      const before = previous.get(id);
       const session = sessions.byId[id];
-      if ((!session && sessions.phase === 'ready') || (conversationVisible && session?.retainedBy?.mainView > 0)) {
-        next.delete(id);
+      if (!session) continue;
+      if (!focused && before?.running === true && state.running === false) {
+        next.add(id);
+        if (session.retainedBy?.mainView > 0) protectedIds.add(id);
+      } else if (state.completionUnread && !before?.completionUnread) {
+        next.add(id);
       }
     }
-    if (next.size === unread.size && [...next].every(id => unread.has(id))) return;
-    unread = next;
-    try { localStorage.setItem(unreadKey, JSON.stringify([...unread])); } catch { /* Keep the in-memory state. */ }
-    for (const listener of listeners) listener();
+    previous = statuses;
+    for (const id of next) {
+      const session = sessions.byId[id];
+      const removed = !session && sessions.phase === 'ready';
+      const read = focused && conversationVisible && session?.retainedBy?.mainView > 0 && !protectedIds.has(id);
+      if (!removed && !read) continue;
+      next.delete(id);
+      protectedIds.delete(id);
+    }
+    save(next, protectedIds);
+    updateTaskbar(sessions, statuses, focused);
+  }
+
+  function acknowledgeCurrent(event) {
+    if (!event.isTrusted || !hasAttention() || panel.getSnapshot().activePanelId !== null) return;
+    if (!(event.target instanceof Element) || !event.target.closest('[data-slot="main"]')) return;
+    const active = Object.values(list.getSnapshot().byId).find(session => session.retainedBy?.mainView > 0);
+    if (!active || !unread.has(active.id)) return;
+    const next = new Set(unread);
+    const protectedIds = new Set(awaitingInteraction);
+    next.delete(active.id);
+    protectedIds.delete(active.id);
+    save(next, protectedIds);
   }
 
   ctx.effect(() => {
-    const stops = [status.subscribe(sync), list.subscribe(sync), panel.subscribe(sync)];
+    const stops = [status.subscribe(sync), list.subscribe(sync), panel.subscribe(sync), ctx.workspaces.list.subscribe(sync)];
+    window.addEventListener('focus', sync);
+    window.addEventListener('blur', sync);
+    document.addEventListener('visibilitychange', sync);
+    document.addEventListener('pointerdown', acknowledgeCurrent, true);
+    document.addEventListener('drop', acknowledgeCurrent, true);
     sync();
-    return () => stops.forEach(stop => stop());
+    return () => {
+      stops.forEach(stop => stop());
+      taskbar?.setReminder?.('normal');
+      window.removeEventListener('focus', sync);
+      window.removeEventListener('blur', sync);
+      document.removeEventListener('visibilitychange', sync);
+      document.removeEventListener('pointerdown', acknowledgeCurrent, true);
+      document.removeEventListener('drop', acknowledgeCurrent, true);
+    };
   });
   return {
     getSnapshot: () => unread,
@@ -347,7 +457,10 @@ function useSidebarMounts(nativeText) {
       workspace = document.querySelector('[data-slot="sidebar.workspaces"]');
       const region = containerOf(workspace?.firstElementChild);
       const area = containerOf(region?.parentElement);
-      const panel = containerOf(area?.parentElement);
+      const scrollport = containerOf(area?.parentElement);
+      const panel = scrollport?.matches('[data-sidebar-scrollport]')
+        ? scrollport.closest('[class*="_sidebarCol"]') ?? scrollport
+        : scrollport;
       const natives = region
         ? [...region.children].filter(child => ![...child.classList].some(name => name.startsWith('dwb-')))
         : [];
@@ -525,7 +638,7 @@ function SessionIcon({ size }) {
   return h('span', { className: 'dwb-session-icon', style: { width: size, height: size, maskImage: `url("${sessionIcon}")` } });
 }
 
-function Browser({ t, nativeText, workspaceSource, sessionSource, view, startFolder, rememberFolder, openSession, toolbar, address, heading, area, panel, display, split, saveSplit, animatePage, useContextMenu, useSessionStatus, startSession, placements, savePlacement, panelSource, scheduleSource, unreadSource }) {
+function Browser({ t, nativeText, workspaceSource, sessionSource, view, startFolder, rememberFolder, openSession, insertBefore, toolbar, address, heading, area, panel, display, split, saveSplit, animatePage, useContextMenu, useSessionStatus, startSession, placements, savePlacement, panelSource, scheduleSource, unreadSource }) {
   const { getTriggerProps } = useContextMenu();
   const workspaceState = useSyncExternalStore(workspaceSource.subscribe, workspaceSource.getSnapshot);
   const sessions = useSyncExternalStore(sessionSource.subscribe, sessionSource.getSnapshot);
@@ -553,10 +666,141 @@ function Browser({ t, nativeText, workspaceSource, sessionSource, view, startFol
     ? { entries: [null], index: 0 } : { entries: [null, startFolder], index: 1 });
   const [openError, setOpenError] = useState(null);
   const [selectedFolder, setSelectedFolder] = useState(null);
-  const [dropTarget, setDropTarget] = useState(null);
-  const dragged = useRef(null);
   const locate = useRef(null);
+  const dragged = useRef(null);
+  const [dropTarget, setDropTarget] = useState(null);
+  const [lifted, setLifted] = useState(false);
   const crumbsRef = useRef(null);
+  // 抓手光标只在真正开始拖动之后出现：按下后移动超过 6px 才算拖动，单纯点击不变。
+  const liftThreshold = 6;
+  useEffect(() => {
+    if (!lifted) return undefined;
+    const clear = () => setLifted(false);
+    // 松手、拖拽结束、拖到别处丢掉时都要落回普通光标，避免拖拽事件被浏览器吞掉后卡在抓手。
+    const types = ['pointerup', 'mouseup', 'pointercancel', 'dragend', 'drop', 'blur'];
+    for (const type of types) window.addEventListener(type, clear, true);
+    return () => {
+      for (const type of types) window.removeEventListener(type, clear, true);
+    };
+  }, [lifted]);
+  function draggedSide(event) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return display === 'list'
+      ? (event.clientY < rect.top + rect.height / 2 ? 'before' : 'after')
+      : (event.clientX < rect.left + rect.width / 2 ? 'before' : 'after');
+  }
+
+  function dragPayload(key) {
+    if (key.startsWith('session:')) {
+      const session = entries.get(key);
+      if (!session || session.blank) return null;
+      const owner = workspaceState.items.find(item => item.sessionIds.includes(session.id));
+      return { key, kind: 'session', id: session.id, accountKey: owner?.workspaceId ?? ungrouped,
+        pinned: pinned.has(session.id) && !archived.has(session.id) };
+    }
+    const item = entries.get(key);
+    return item ? { key, kind: 'folder', id: item.workspaceId, parent: folder } : null;
+  }
+
+  /* A drop only counts where the native tree would also take it: same account, same pinned section. */
+  function accepts(drag, target) {
+    if (!drag || drag.key === target.key || drag.kind !== target.kind) return false;
+    if (drag.kind === 'session') return drag.accountKey === target.accountKey && drag.pinned === target.pinned;
+    return drag.parent === target.parent;
+  }
+
+  function dropSession(drag, target, side) {
+    const snapshot = view.getSnapshot();
+    const actions = view.actions ?? {};
+    if (snapshot.orderBy !== 'manual' || !accepts(drag, target)) return;
+    if (typeof actions.setSessionOrder !== 'function') return;
+    const orders = displayedOrders(workspaceState, sessions, snapshot);
+    const rows = byWorkspace.get(drag.accountKey) ?? [];
+    const isPinned = id => pinned.has(id) && !archived.has(id);
+    const next = sessionDragOrder(orders[drag.accountKey] ?? [], rows, drag, { id: target.id, side }, isPinned);
+    if (!next) return;
+    actions.setSessionOrder(drag.accountKey, next, orders);
+  }
+
+  function dropFolder(drag, target, side) {
+    if (typeof insertBefore !== 'function' || !accepts(drag, target)) return;
+    const ids = (children.get(folder) ?? []).map(item => item.workspaceId);
+    if (!ids.includes(drag.id) || !ids.includes(target.id)) return;
+    const rest = ids.filter(id => id !== drag.id);
+    const index = rest.indexOf(target.id) + (side === 'after' ? 1 : 0);
+    rest.splice(index, 0, drag.id);
+    if (rest.join() === ids.join()) return;
+    try {
+      Promise.resolve(insertBefore(drag.id, rest[index + 1])).catch(() => {});
+    } catch { /* Older hosts hide the Workspace writer. */ }
+  }
+
+  function dragProps(key) {
+    if (options.orderBy !== 'manual' || key === folderKey(ungrouped)) return {};
+    const payload = dragPayload(key);
+    if (!payload) return {};
+    return {
+      draggable: true,
+      'data-dwb-drop': dropTarget?.key === key ? dropTarget.side : undefined,
+      onPointerDown: event => {
+        if (event.button !== 0) return;
+        const startX = event.clientX;
+        const startY = event.clientY;
+        const finish = () => {
+          window.removeEventListener('pointermove', move);
+          window.removeEventListener('pointerup', release);
+          window.removeEventListener('pointercancel', release);
+        };
+        function move(moveEvent) {
+          if (Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) < liftThreshold) return;
+          setLifted(true);
+          finish();
+        }
+        function release() {
+          if (!dragged.current) setLifted(false);
+          finish();
+        }
+        window.addEventListener('pointermove', move);
+        window.addEventListener('pointerup', release);
+        window.addEventListener('pointercancel', release);
+      },
+      onDragStart: event => {
+        dragged.current = payload;
+        setLifted(true);
+        if (!event.dataTransfer) return;
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', key);
+      },
+      onDragOver: event => {
+        if (!accepts(dragged.current, payload)) return;
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+        const side = draggedSide(event);
+        setDropTarget(current => (current?.key === key && current.side === side ? current : { key, side }));
+      },
+      onDragLeave: event => {
+        if (event.currentTarget.contains(event.relatedTarget)) return;
+        setDropTarget(current => (current?.key === key ? null : current));
+      },
+      onDrop: event => {
+        const drag = dragged.current;
+        dragged.current = null;
+        setDropTarget(null);
+        setLifted(false);
+        if (!accepts(drag, payload)) return;
+        event.preventDefault();
+        const side = draggedSide(event);
+        if (drag.kind === 'session') dropSession(drag, payload, side);
+        else dropFolder(drag, payload, side);
+      },
+      onDragEnd: () => {
+        dragged.current = null;
+        setDropTarget(null);
+        setLifted(false);
+      },
+    };
+  }
+
   useEffect(() => {
     const path = crumbsRef.current;
     function scrollPath(event) {
@@ -611,7 +855,6 @@ function Browser({ t, nativeText, workspaceSource, sessionSource, view, startFol
   }, [byWorkspace, onlyArchived, parents]);
   const folders = (children.get(folder) ?? []).filter(item => !onlyArchived || foldersWithArchives.has(item.workspaceId));
   const placement = placements?.[pageKey(folder)];
-  const order = placement?.order ?? [];
   const rows = byWorkspace.get(folder) ?? [];
   const rowIds = new Set(rows.map(row => row.id));
   const shortcuts = (placement?.shortcuts ?? []).map(id => sessions.byId[id]).filter(session => session
@@ -690,7 +933,7 @@ function Browser({ t, nativeText, workspaceSource, sessionSource, view, startFol
     ...(hasUngrouped ? [[folderKey(ungrouped), null]] : []),
     ...[...rows, ...shortcuts].map(session => [sessionKey(session.id), session]),
   ]);
-  const keys = [...new Set([...order.filter(key => entries.has(key)), ...entries.keys()])];
+  const keys = [...entries.keys()];
   const activeKey = activeSession && sessionKey(activeSession.id);
   const hasActiveTile = entries.has(activeKey);
   const empty = keys.length === 0;
@@ -704,18 +947,13 @@ function Browser({ t, nativeText, workspaceSource, sessionSource, view, startFol
       if (!workspaceState.items.length) return;
       event.preventDefault();
       event.stopPropagation();
-      const activeAnchor = hasActiveTile ? activeKey : folderKey(guideFolder);
-      const anchor = entries.has(selectedFolder) ? selectedFolder : activeAnchor;
       setSelectedFolder(null);
       setOpenError(null);
       startSession(workspaceId, sessionId => {
-        const key = sessionKey(sessionId);
+        if (inWorkspace) return;
         savePlacement(folder, (saved = {}) => {
-          const next = [...new Set([...(saved.order ?? []), ...keys])].filter(item => item !== key);
-          const index = next.indexOf(anchor);
-          next.splice(index < 0 ? next.length : index + 1, 0, key);
           const shortcuts = saved.shortcuts ?? [];
-          return { order: next, shortcuts: inWorkspace || shortcuts.includes(sessionId) ? shortcuts : [...shortcuts, sessionId] };
+          return { shortcuts: shortcuts.includes(sessionId) ? shortcuts : [...shortcuts, sessionId] };
         });
       }).catch(() => setOpenError('create'));
     }
@@ -740,58 +978,6 @@ function Browser({ t, nativeText, workspaceSource, sessionSource, view, startFol
     locate.current = null;
     item.focus({ preventScroll: true });
     item.scrollIntoView({ block: 'nearest' });
-  }
-
-  function draggedPosition(event) {
-    const box = event.currentTarget.getBoundingClientRect();
-    if (display === 'list') return event.clientY < box.top + box.height / 2 ? 'before' : 'after';
-    const before = event.clientX < box.left + box.width / 2;
-    return before !== (getComputedStyle(event.currentTarget).direction === 'rtl') ? 'before' : 'after';
-  }
-
-  function dragProps(key) {
-    return {
-      draggable: true,
-      'data-dwb-drop': dropTarget?.key === key ? dropTarget.position : undefined,
-      onDragStart: event => {
-        dragged.current = key;
-        event.dataTransfer.effectAllowed = 'move';
-        event.dataTransfer.setData('application/x-dsh-workspace-browser', key);
-      },
-      onDragOver: event => {
-        if (dragged.current === null || dragged.current === key) {
-          setDropTarget(null);
-          return;
-        }
-        event.preventDefault();
-        event.dataTransfer.dropEffect = 'move';
-        const position = draggedPosition(event);
-        setDropTarget(previous => previous?.key === key && previous.position === position ? previous : { key, position });
-      },
-      onDragLeave: event => {
-        if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return;
-        setDropTarget(previous => previous?.key === key ? null : previous);
-      },
-      onDrop: event => {
-        const source = dragged.current;
-        if (source === null || source === key || !entries.has(source)) return;
-        event.preventDefault();
-        const position = draggedPosition(event);
-        const next = keys.filter(item => item !== source);
-        next.splice(next.indexOf(key) + (position === 'after' ? 1 : 0), 0, source);
-        savePlacement(folder, (saved = {}) => {
-          let index = 0;
-          const order = (saved.order ?? []).map(item => entries.has(item) ? next[index++] : item);
-          return { ...saved, order: [...order, ...next.slice(index)] };
-        });
-        dragged.current = null;
-        setDropTarget(null);
-      },
-      onDragEnd: () => {
-        dragged.current = null;
-        setDropTarget(null);
-      },
-    };
   }
 
   useLayoutEffect(() => {
@@ -867,7 +1053,7 @@ function Browser({ t, nativeText, workspaceSource, sessionSource, view, startFol
         ? nativeText('toast.archivedNotOpenable') : t(openError === 'create' ? 'createError' : 'openError')),
       empty && workspaceState.state !== 'error' && h('p', { className: 'dwb-status', role: 'status' },
         t(loading ? 'loading' : onlyArchived ? 'noArchives' : folder === null ? 'emptyHome' : 'emptyFolder')),
-      !empty && h('ul', { className: 'dwb-list', 'data-dwb-display': display },
+      !empty && h('ul', { className: 'dwb-list', 'data-dwb-display': display, 'data-dwb-lifted': lifted ? 'true' : undefined },
         keys.map(key => {
           const item = entries.get(key);
           if (item === null) return folderTile(ungrouped, t('ungrouped'));
@@ -891,7 +1077,7 @@ function Browser({ t, nativeText, workspaceSource, sessionSource, view, startFol
         }))));
 }
 
-function SidebarExtension({ t, nativeText, workspaceSource, sessionSource, nativeEntry, openSession, startSession, useContextMenu, useSessionStatus, panelSource, scheduleSource, unreadSource }) {
+function SidebarExtension({ t, nativeText, workspaceSource, sessionSource, nativeEntry, openSession, startSession, insertBefore, useContextMenu, useSessionStatus, panelSource, scheduleSource, unreadSource }) {
   const [preference, setPreference] = useState(readPreference);
   const enabled = preference.enabled === true;
   const fade = usePageFade();
@@ -905,7 +1091,7 @@ function SidebarExtension({ t, nativeText, workspaceSource, sessionSource, nativ
     setDisplay: display => setPreference(previous => ({ ...previous, display })),
     saveSplit: split => setPreference(previous => ({ ...previous, split })),
     savePlacement: (folder, update) => setPreference(previous => {
-      const placements = previous.placements ?? emptyOrder;
+      const placements = previous.placements ?? emptyPlacements;
       const key = pageKey(folder);
       return { ...previous, placements: { ...placements, [key]: update(placements[key]) } };
     }),
@@ -987,7 +1173,8 @@ function SidebarExtension({ t, nativeText, workspaceSource, sessionSource, nativ
       [nativeText('groupBy.workspace'), () => { actions.setEnabled(false, list); setGroupBy('workspace'); }],
       [nativeText('groupBy.workspaceTree'), () => { actions.setEnabled(false, list); setGroupBy('workspace-tree'); }],
       [nativeText('groupBy.flat'), () => { actions.setEnabled(false, list); setGroupBy('flat'); }],
-      [nativeText('orderBy.manual'), () => setOrderBy('manual', manualOrders(workspaceSource.getSnapshot(), sessionSource.getSnapshot()))],
+      [nativeText('orderBy.manual'), () => setOrderBy('manual', displayedOrders(
+        workspaceSource.getSnapshot(), sessionSource.getSnapshot(), view.getSnapshot()))],
       [nativeText('orderBy.updated'), () => setOrderBy('updated', {})],
       [nativeText('viewOptions.hideArchived'), () => setArchivedFilter('default')],
       [nativeText('viewOptions.showArchived'), () => setArchivedFilter('show')],
@@ -1038,7 +1225,7 @@ function SidebarExtension({ t, nativeText, workspaceSource, sessionSource, nativ
         }),
       )), menuMount),
     enabled && grid && createPortal(h(Browser, {
-      t, nativeText, workspaceSource, sessionSource, view, openSession: openConversation, toolbar, address, heading, area, panel, display, animatePage, useContextMenu, useSessionStatus,
+      t, nativeText, workspaceSource, sessionSource, view, openSession: openConversation, insertBefore, toolbar, address, heading, area, panel, display, animatePage, useContextMenu, useSessionStatus,
       split: !trigger ? null : preference.split, saveSplit: actions.saveSplit,
       startSession, placements: preference.placements, savePlacement: actions.savePlacement, panelSource, scheduleSource, unreadSource,
       startFolder: typeof preference.folder === 'string' ? preference.folder : null, rememberFolder: actions.rememberFolder,
@@ -1072,6 +1259,7 @@ function apply(ctx) {
     name: 'shell.overlay', id, locale: id,
     inject: () => ({
       nativeText, workspaceSource, sessionSource, nativeEntry, panelSource, scheduleSource, unreadSource,
+      insertBefore: (workspaceId, beforeWorkspaceId) => ctx.workspaces.insertBefore(workspaceId, beforeWorkspaceId),
       openSession: sessionId => navigation.openSession(sessionId),
       startSession: (workspaceId, onCreated) => {
         const snapshot = sessions.getSnapshot();

@@ -42,6 +42,17 @@
   --dwb-visibility-delay: var(--dwb-reveal-delay);
 }
 
+/* DSH's shared scrollport normally sizes its workspace row to its content.
+   Give the browser's own scroll area the remaining height in folder mode. */
+[data-sidebar-scrollport]:has([data-dwb-grid]) {
+  grid-template-rows: 8px max-content 2px minmax(0, 1fr);
+  overflow: hidden;
+}
+
+[data-sidebar-scrollport] [data-dwb-layout]:has(> [data-dwb-grid]) {
+  flex: 1 1 0;
+}
+
 [data-slot='sidebar.workspaces'] [data-dwb-layout] > [data-dwb-grid] {
   margin-inline: 0;
   padding-inline: 0;
@@ -242,6 +253,7 @@
 .dwb-list[data-dwb-display='list'] > li[data-dwb-drop]::after { inset-inline: 0; height: 2px; }
 .dwb-list[data-dwb-display='list'] > li[data-dwb-drop='before']::after { inset-block-start: 0; }
 .dwb-list[data-dwb-display='list'] > li[data-dwb-drop='after']::after { inset-block-end: 0; }
+.dwb-list[data-dwb-lifted='true'] .dwb-tile { cursor: grabbing; }
 
 .dwb-list .dwb-tile {
   position: relative;
