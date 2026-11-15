@@ -2,7 +2,7 @@ const { createElement: h, useEffect, useLayoutEffect, useMemo, useRef, useState,
 const {
   Button, MenuItemButton, StateDot, IconCheckOutlineRegular, IconChevronLeftOutlineRegular, IconChevronRightOutlineRegular,
   IconChevronUpOutlineRegular, IconFolderOpenRegular,
-  IconPinFillRegular, IconFlatListOutlineRegular, IconArchiveOutlineRegular, IconClockOutlineRegular,
+  IconPinFillRegular, IconArchiveOutlineRegular, IconClockOutlineRegular,
 } = ui;
 
 const inject = ['slots', 'locale', 'workspaces', 'sessions', 'uiSession', 'uiWorkspace', 'layout', 'remote', 'remote.schedule'];
@@ -112,6 +112,25 @@ function workspaceTree(items) {
     children.get(parent).push(item);
   }
   return { byId, parents, children };
+}
+
+function manualOrders(workspaces, sessions) {
+  const assigned = new Set(workspaces.items.flatMap(item => item.sessionIds));
+  const byRecency = ids => ids.filter(id => sessions.byId[id]).sort((a, b) =>
+    sessions.byId[b].updatedAt - sessions.byId[a].updatedAt || (a < b ? -1 : 1));
+  const activeBlank = sessions.ids.find(id => sessions.byId[id]?.blank && sessions.byId[id].retainedBy?.mainView > 0);
+  const order = ids => {
+    const sorted = byRecency(ids);
+    return sorted.includes(activeBlank) ? [activeBlank, ...sorted.filter(id => id !== activeBlank)] : sorted;
+  };
+  return Object.fromEntries([
+    ...workspaces.items.map(item => [item.workspaceId, order(item.sessionIds)]),
+    [ungrouped, order(sessions.ids.filter(id => !assigned.has(id)))],
+    ['__flat_session_order__', order(sessions.ids.filter(id => {
+      const session = sessions.byId[id];
+      return session && session.origin !== 'subagent' && (!session.blank || id === activeBlank);
+    }))],
+  ]);
 }
 
 function sessionRows(workspaceState, sessions, options) {
@@ -303,7 +322,7 @@ function containerOf(node) {
 // (`[data-slot="sidebar.workspaces"]`) and read the browser's own boxes by
 // position: our mounts are known by class, the header is the first native child
 // of the region and the list is the last one.
-function useSidebarMounts(nativeText, setEnabled) {
+function useSidebarMounts(nativeText) {
   const [mounts, setMounts] = useState({});
   useLayoutEffect(() => {
     const grid = document.createElement('div');
@@ -403,12 +422,6 @@ function useSidebarMounts(nativeText, setEnabled) {
       frame = requestAnimationFrame(() => { frame = 0; sync(); });
     }
 
-    function selectNative(event) {
-      // Only our injected menu proves this is the view-options menu.
-      if (!active?.menuBody?.contains(active.menuMount) || !(event.target instanceof Element)) return;
-      if (active.groupRows.includes(event.target.closest('button'))) setEnabled(false, active.list);
-    }
-
     const observer = new MutationObserver(records => {
       if (!workspace?.isConnected || records.some(record =>
         workspace.contains(record.target) || active?.menu?.contains(record.target)
@@ -417,20 +430,18 @@ function useSidebarMounts(nativeText, setEnabled) {
     });
     observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-expanded', 'aria-label'] });
     document.addEventListener('input', schedule);
-    document.addEventListener('click', selectNative, true);
     sync();
     return () => {
       observer.disconnect();
       cancelAnimationFrame(frame);
       document.removeEventListener('input', schedule);
-      document.removeEventListener('click', selectNative, true);
       grid.remove();
       toolbar.remove();
       address.remove();
       heading.remove();
       menuMount.remove();
     };
-  }, [nativeText, setEnabled]);
+  }, [nativeText]);
   return mounts;
 }
 
@@ -899,7 +910,7 @@ function SidebarExtension({ t, nativeText, workspaceSource, sessionSource, nativ
       return { ...previous, placements: { ...placements, [key]: update(placements[key]) } };
     }),
   }));
-  const { grid, list, toolbar, address, header, heading, nativeHeading, trigger, menu, menuMount, menuSeparator, menuLabel, searching, searchOpen, region, area, panel } = useSidebarMounts(nativeText, actions.setEnabled);
+  const { grid, list, toolbar, address, header, heading, nativeHeading, trigger, menu, menuMount, menuSeparator, menuLabel, searching, searchOpen, region, area, panel } = useSidebarMounts(nativeText);
   const display = preference.display === 'list' ? 'list' : 'icons';
   const entry = useSyncExternalStore(nativeEntry.subscribe, nativeEntry.getSnapshot);
   const view = useMemo(() => entry?.store?.create() ?? emptyView, [entry]);
@@ -969,26 +980,60 @@ function SidebarExtension({ t, nativeText, workspaceSource, sessionSource, nativ
     return () => menu.removeAttribute('data-dwb-selected');
   }, [menu, enabled]);
 
-  function closeMenu() {
-    trigger.focus({ preventScroll: true });
-    trigger.click();
-  }
+  useLayoutEffect(() => {
+    if (!menu || !trigger || !view.actions) return;
+    const { setGroupBy, setOrderBy, setArchivedFilter } = view.actions;
+    const select = new Map([
+      [nativeText('groupBy.workspace'), () => { actions.setEnabled(false, list); setGroupBy('workspace'); }],
+      [nativeText('groupBy.workspaceTree'), () => { actions.setEnabled(false, list); setGroupBy('workspace-tree'); }],
+      [nativeText('groupBy.flat'), () => { actions.setEnabled(false, list); setGroupBy('flat'); }],
+      [nativeText('orderBy.manual'), () => setOrderBy('manual', manualOrders(workspaceSource.getSnapshot(), sessionSource.getSnapshot()))],
+      [nativeText('orderBy.updated'), () => setOrderBy('updated', {})],
+      [nativeText('viewOptions.hideArchived'), () => setArchivedFilter('default')],
+      [nativeText('viewOptions.showArchived'), () => setArchivedFilter('show')],
+      [nativeText('viewOptions.onlyArchived'), () => setArchivedFilter('only')],
+    ]);
+    function selectNative(event) {
+      const button = event.target instanceof Element && event.target.closest('button[role="menuitem"]');
+      if (!button || menuMount.contains(button)) return;
+      const apply = select.get(button.textContent.trim());
+      if (!apply) return;
+      event.preventDefault();
+      event.stopPropagation();
+      apply();
+    }
+    let closing = false;
+    function dismissOutside(event) {
+      if (closing || menu.contains(event.target) || trigger.contains(event.target)) return;
+      closing = true;
+      trigger.click();
+    }
+    menu.addEventListener('click', selectNative, true);
+    document.addEventListener('wheel', dismissOutside, { capture: true, passive: true });
+    document.addEventListener('contextmenu', dismissOutside, true);
+    return () => {
+      menu.removeEventListener('click', selectNative, true);
+      document.removeEventListener('wheel', dismissOutside, true);
+      document.removeEventListener('contextmenu', dismissOutside, true);
+    };
+  }, [menu, trigger, menuMount, view, actions, list, nativeText, workspaceSource, sessionSource]);
 
-  function menuItem(label, icon, current, select) {
-    return h(MenuItemButton, { current, icon, onSelect: () => { select(); closeMenu(); } },
+  function menuItem(label, src, current, select) {
+    const icon = h('img', { className: 'dwb-menu-icon', src, alt: '', width: 16, height: 16, draggable: false });
+    return h(MenuItemButton, { current, icon, onSelect: select },
       h('span', { className: 'dwb-menu-label' }, t(label), current && h(IconCheckOutlineRegular, { size: 14, 'aria-hidden': true })));
   }
 
   return h(react.Fragment, null,
     menu && createPortal(h(react.Fragment, null,
-      menuItem('panel', h(IconFolderOpenRegular, { size: 16, 'aria-hidden': true }), enabled, () => actions.setEnabled(true, list)),
+      menuItem('panel', menuFolderIcon, enabled, () => actions.setEnabled(true, list)),
       enabled && h(react.Fragment, null,
         h('div', { role: 'separator', className: menuSeparator?.className }),
         h('div', { role: 'presentation', className: menuLabel?.className }, t('display')),
-        menuItem('icons', h('span', { className: 'dwb-menu-grid', 'aria-hidden': true }), display === 'icons', () => {
+        menuItem('icons', largeIconsMenuIcon, display === 'icons', () => {
           if (display !== 'icons') animatePage(() => actions.setDisplay('icons'));
         }),
-        menuItem('list', h(IconFlatListOutlineRegular, { size: 16, 'aria-hidden': true }), display === 'list', () => {
+        menuItem('list', listMenuIcon, display === 'list', () => {
           if (display !== 'list') animatePage(() => actions.setDisplay('list'));
         }),
       )), menuMount),
