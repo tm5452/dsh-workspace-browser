@@ -19,6 +19,23 @@
 - 文件夹浏览支持从左侧栏任意位置开始的右键手势。按住右键向左后退、向右前进、向上返回上一级，松手时执行。单击右键保留原来的菜单行为。
 - 排序和归档筛选沿用「视图选项」中的设置。搜索时显示 DSH 原生搜索结果，清空后回到当前目录。
 
+## 截图
+
+<table>
+  <tr>
+    <td><img src="https://raw.githubusercontent.com/tm5452/dsh-workspace-browser/main/screenshots/1.png" width="220" alt="文件夹浏览 1"></td>
+    <td><img src="https://raw.githubusercontent.com/tm5452/dsh-workspace-browser/main/screenshots/2.png" width="220" alt="文件夹浏览 2"></td>
+    <td><img src="https://raw.githubusercontent.com/tm5452/dsh-workspace-browser/main/screenshots/3.png" width="220" alt="文件夹浏览 3"></td>
+    <td><img src="https://raw.githubusercontent.com/tm5452/dsh-workspace-browser/main/screenshots/4.png" width="220" alt="文件夹浏览 4"></td>
+  </tr>
+  <tr>
+    <td><img src="https://raw.githubusercontent.com/tm5452/dsh-workspace-browser/main/screenshots/5.png" width="220" alt="文件夹浏览 5"></td>
+    <td><img src="https://raw.githubusercontent.com/tm5452/dsh-workspace-browser/main/screenshots/6.png" width="220" alt="文件夹浏览 6"></td>
+    <td><img src="https://raw.githubusercontent.com/tm5452/dsh-workspace-browser/main/screenshots/7.png" width="220" alt="文件夹浏览 7"></td>
+    <td></td>
+  </tr>
+</table>
+
 ## 本地构建
 
 在源码目录运行 `npm pack`，即可生成 `.tgz`。插件使用 DSH 提供的界面组件和主题，构建无需安装依赖。
